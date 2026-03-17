@@ -23,16 +23,20 @@ params.maf = 0.01        // 1% minor allele frequency
 genome_ch = Channel.fromPath(params.genome)
 genome_index_ch = Channel.fromPath("${params.genome_index_dir}/${params.genome_index_base}*.bt2")
 
-// Download Process
+// Process to download SRA data using native modules with robust error handling
 process FETCHNGS {
     publishDir "${params.temp_fastq}", mode: 'copy'
     module 'StdEnv/2023:sra-toolkit/3.0.9'
+
+    // Error handling: retry up to 2 times, then ignore failures
+    errorStrategy 'retry'
+    maxRetries 2
 
     input:
     val accession
 
     output:
-    tuple val(accession), path("*.fastq.gz"), emit: fastq_files
+    tuple val(accession), path("*.fastq.gz"), emit: fastq_files, optional: true
 
     script:
     """
@@ -43,9 +47,66 @@ process FETCHNGS {
 /libs/cloud/report_instance_identity = "true"
 EOF
 
-    # Download and compress
-    fasterq-dump ${accession} --split-files
-    gzip *.fastq
+    # Function to try fasterq-dump first, fallback to fastq-dump
+    download_sra() {
+        echo "Attempt \${1}: Trying fasterq-dump for ${accession}..."
+
+        if fasterq-dump ${accession} --split-files 2>&1; then
+            echo "fasterq-dump succeeded"
+            gzip *.fastq
+            return 0
+        else
+            echo "fasterq-dump failed, trying fastq-dump as fallback..."
+
+            # Clean up any partial files
+            rm -f *.fastq 2>/dev/null || true
+
+            # Try fastq-dump with different options
+            if fastq-dump --split-files --gzip ${accession} 2>&1; then
+                echo "fastq-dump succeeded"
+                return 0
+            else
+                echo "Both methods failed for ${accession}"
+                return 1
+            fi
+        fi
+    }
+
+    # Try download with retry logic
+    attempt=1
+    max_attempts=3
+    success=false
+
+    while [ \$attempt -le \$max_attempts ] && [ "\$success" = "false" ]; do
+        echo "Download attempt \$attempt of \$max_attempts for ${accession}"
+
+        if download_sra \$attempt; then
+            success=true
+            echo "Successfully downloaded ${accession}"
+        else
+            echo "Attempt \$attempt failed"
+            attempt=\$((attempt + 1))
+            if [ \$attempt -le \$max_attempts ]; then
+                echo "Waiting 30 seconds before retry..."
+                sleep 30
+            fi
+        fi
+    done
+
+    if [ "\$success" = "false" ]; then
+        echo "ERROR: All download attempts failed for ${accession}"
+        echo "This accession will be skipped from further analysis"
+        exit 1
+    fi
+
+    # Verify we have output files
+    if ! ls *.fastq.gz 1> /dev/null 2>&1; then
+        echo "ERROR: No FASTQ files were generated for ${accession}"
+        exit 1
+    fi
+
+    echo "Download completed successfully for ${accession}"
+    ls -lh *.fastq.gz
     """
 }
 
